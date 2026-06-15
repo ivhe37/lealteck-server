@@ -438,6 +438,36 @@ app.get('/planes', async (_req, res) => {
   }
 })
 
+// ─────────────────────────────────────────────────────────────────────
+//  POST /admin/linkear-negocio
+//  Crea manualmente la entrada userBusinessMap para negocios existentes
+//  Cuerpo: { email, businessId }
+//  Header: x-admin-token: <MP_ACCESS_TOKEN>
+// ─────────────────────────────────────────────────────────────────────
+app.post('/admin/linkear-negocio', async (req, res) => {
+  const auth = req.headers['x-admin-token']
+  if (auth !== process.env.MP_ACCESS_TOKEN) {
+    return res.status(401).json({ error: 'No autorizado.' })
+  }
+
+  const { email, businessId } = req.body || {}
+  if (!email || !businessId) {
+    return res.status(400).json({ error: 'Faltan email y/o businessId.' })
+  }
+
+  try {
+    const emailKey = email.replace(/[.@]/g, '_')
+    await db.collection('platform').doc('userBusinessMap')
+      .collection('byEmail').doc(emailKey).set({ businessId, email })
+
+    console.log(`[linkear-negocio] ${email} → ${businessId}`)
+    res.json({ ok: true, emailKey, businessId })
+  } catch (err) {
+    console.error('[/admin/linkear-negocio] Error:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
 // ── Arranque ──────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001
 app.listen(PORT, () => {
