@@ -107,11 +107,26 @@ async function enviarEmailBienvenida({ nombre, email, plan, businessId }) {
               Ir a mi panel →
             </a>
           </p>
+          <hr style="border:none;border-top:1px solid #e5d5c0;margin:24px 0">
+          <p style="font-weight:700;margin-bottom:8px">🔷 QR para tus clientes</p>
+          <p style="color:#8b7355;font-size:0.9rem;margin-bottom:16px">
+            Imprimí o mostrá este código QR en tu local. Tus clientes lo escanean
+            para acceder a tu carta y programa de fidelización.
+          </p>
+          <div style="text-align:center;margin:16px 0">
+            <img
+              src="https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=https%3A%2F%2F${businessId}.lealteck.com&color=1c1410&bgcolor=ffffff&margin=10"
+              alt="QR ${businessId}.lealteck.com"
+              width="220" height="220"
+              style="border:1px solid #e5d5c0;border-radius:8px"
+            />
+            <p style="color:#8b7355;font-size:0.82rem;margin-top:8px">${businessId}.lealteck.com</p>
+          </div>
+          <hr style="border:none;border-top:1px solid #e5d5c0;margin:24px 0">
           <p style="color:#8b7355;font-size:0.9rem">
             Si tenés alguna duda, respondé este email o escribinos por WhatsApp.
             Estamos para ayudarte.
           </p>
-          <hr style="border:none;border-top:1px solid #e5d5c0;margin:24px 0">
           <p style="color:#8b7355;font-size:0.8rem">Lealteck · Plataforma de fidelización para restaurantes y cafés</p>
         </div>
       `,
