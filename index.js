@@ -17,6 +17,11 @@ const express   = require('express')
 const cors      = require('cors')
 const admin     = require('firebase-admin')
 const { MercadoPagoConfig, PreApprovalPlan, PreApproval, Preference } = require('mercadopago')
+const { Resend } = require('resend')
+
+const resend = new Resend(process.env.RESEND_API_KEY)
+const IVAN_EMAIL   = 'ivhe750@gmail.com'
+const FROM_EMAIL   = 'Lealteck <onboarding@resend.dev>'
 
 // ── 1. Firebase Admin ─────────────────────────────────────────────────
 admin.initializeApp({
@@ -82,6 +87,71 @@ const PLANES_CONFIG = [
 ]
 
 // ─────────────────────────────────────────────────────────────────────
+//  EMAILS
+// ─────────────────────────────────────────────────────────────────────
+async function enviarEmailBienvenida({ nombre, email, plan, businessId }) {
+  const NOMBRE_PLAN = { lealcard: 'LealCard', lealorder: 'LealOrder', lealfull: 'LealFull' }
+  try {
+    await resend.emails.send({
+      from:    FROM_EMAIL,
+      to:      email,
+      subject: `¡Bienvenido a Lealteck, ${nombre}! Tu cuenta está activa 🎉`,
+      html: `
+        <div style="font-family:system-ui,sans-serif;max-width:520px;margin:0 auto;color:#1c1410">
+          <h1 style="color:#c47a3a">¡Hola, ${nombre}!</h1>
+          <p>Tu cuenta de Lealteck con el plan <strong>${NOMBRE_PLAN[plan] || plan}</strong> ya está activa.</p>
+          <p>Podés acceder a tu panel de administración en:</p>
+          <p style="margin:20px 0">
+            <a href="https://${businessId}.lealteck.com"
+               style="background:#c47a3a;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:700">
+              Ir a mi panel →
+            </a>
+          </p>
+          <p style="color:#8b7355;font-size:0.9rem">
+            Si tenés alguna duda, respondé este email o escribinos por WhatsApp.
+            Estamos para ayudarte.
+          </p>
+          <hr style="border:none;border-top:1px solid #e5d5c0;margin:24px 0">
+          <p style="color:#8b7355;font-size:0.8rem">Lealteck · Plataforma de fidelización para restaurantes y cafés</p>
+        </div>
+      `,
+    })
+    console.log('[email] Bienvenida enviada a:', email)
+  } catch (err) {
+    console.error('[email] Error enviando bienvenida:', err)
+  }
+}
+
+async function notificarRegistroNuevo({ nombre, rubro, dueno, email, whatsapp, plan, registroId }) {
+  const NOMBRE_PLAN = { lealcard: 'LealCard (S/60)', lealorder: 'LealOrder (S/90)', lealfull: 'LealFull (S/120)' }
+  try {
+    await resend.emails.send({
+      from:    FROM_EMAIL,
+      to:      IVAN_EMAIL,
+      subject: `🆕 Nuevo registro: ${nombre}`,
+      html: `
+        <div style="font-family:system-ui,sans-serif;max-width:520px;margin:0 auto;color:#1c1410">
+          <h2>Nuevo negocio registrado</h2>
+          <table style="width:100%;border-collapse:collapse">
+            <tr><td style="padding:6px 0;color:#8b7355;width:130px">Negocio</td><td><strong>${nombre}</strong></td></tr>
+            <tr><td style="padding:6px 0;color:#8b7355">Rubro</td><td>${rubro || '—'}</td></tr>
+            <tr><td style="padding:6px 0;color:#8b7355">Dueño</td><td>${dueno || '—'}</td></tr>
+            <tr><td style="padding:6px 0;color:#8b7355">Email</td><td>${email}</td></tr>
+            <tr><td style="padding:6px 0;color:#8b7355">WhatsApp</td><td>${whatsapp}</td></tr>
+            <tr><td style="padding:6px 0;color:#8b7355">Plan</td><td><strong>${NOMBRE_PLAN[plan] || plan}</strong></td></tr>
+            <tr><td style="padding:6px 0;color:#8b7355">Estado</td><td>⏳ Pendiente de pago en MP</td></tr>
+          </table>
+          <p style="margin-top:20px;color:#8b7355;font-size:0.85rem">ID registro: ${registroId}</p>
+        </div>
+      `,
+    })
+    console.log('[email] Notificación enviada a Ivan')
+  } catch (err) {
+    console.error('[email] Error notificando registro:', err)
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 //  GET /health
 // ─────────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
@@ -138,14 +208,15 @@ app.post('/registro', async (req, res) => {
       ? `https://www.mercadopago.com.pe/subscriptions/checkout?preapproval_plan_id=${planId}&external_reference=${registroId}&payer_email=${encodeURIComponent(email)}`
       : `https://www.mercadopago.com.pe/subscriptions/checkout?preapproval_plan_id=${planId}`
 
-    // Actualizamos el registro con su propio ID y la URL generada
-    await ref.update({ registroId, urlSuscripcion: init_url })
+    const urlSuscripcion = `https://www.mercadopago.com.pe/subscriptions/checkout?preapproval_plan_id=${planId}&external_reference=${registroId}&payer_email=${encodeURIComponent(email)}`
 
-    res.json({
-      ok:          true,
-      registroId,
-      urlSuscripcion: `https://www.mercadopago.com.pe/subscriptions/checkout?preapproval_plan_id=${planId}&external_reference=${registroId}&payer_email=${encodeURIComponent(email)}`,
-    })
+    // Actualizamos el registro con su propio ID y la URL generada
+    await ref.update({ registroId, urlSuscripcion })
+
+    // Notificar a Ivan por email (no bloqueante)
+    notificarRegistroNuevo({ nombre, rubro, dueno, email, whatsapp, plan, registroId })
+
+    res.json({ ok: true, registroId, urlSuscripcion })
   } catch (err) {
     console.error('[/registro] Error:', err)
     res.status(500).json({ error: err.message })
@@ -259,7 +330,24 @@ async function activarNegocio({ registro, registroId, sub }) {
     activadoEn: ahora,
   })
 
+  // Índice email → businessId para el login centralizado
+  // Clave: email con @ y . reemplazados para ser doc ID válido
+  const emailKey = registro.email.replace(/[.@]/g, '_')
+  await db.collection('platform').doc('userBusinessMap')
+    .collection('byEmail').doc(emailKey).set({
+      businessId,
+      email: registro.email,
+    })
+
   console.log('[activarNegocio] Negocio activado:', businessId)
+
+  // Email de bienvenida al nuevo negocio (no bloqueante)
+  enviarEmailBienvenida({
+    nombre:     registro.nombre,
+    email:      registro.email,
+    plan:       registro.plan,
+    businessId,
+  })
 }
 
 // ─────────────────────────────────────────────────────────────────────

@@ -11,6 +11,7 @@
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "firebase-admin": "^12.2.0",
-    "mercadopago": "^2.0.15"
+    "mercadopago": "^2.0.15",
+    "resend": "^3.2.0"
   }
 }
