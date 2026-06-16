@@ -454,6 +454,69 @@ app.get('/planes', async (_req, res) => {
 })
 
 // ─────────────────────────────────────────────────────────────────────
+//  POST /cancelar-suscripcion
+//  El dueño del negocio cancela su suscripción desde su panel.
+//  Header: Authorization: Bearer <firebase-id-token>
+//  Cuerpo: { businessId }
+// ─────────────────────────────────────────────────────────────────────
+app.post('/cancelar-suscripcion', async (req, res) => {
+  // Verificar Firebase ID token
+  const authHeader = req.headers['authorization'] || ''
+  const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null
+  if (!idToken) return res.status(401).json({ error: 'Token requerido.' })
+
+  let decoded
+  try {
+    decoded = await admin.auth().verifyIdToken(idToken)
+  } catch {
+    return res.status(401).json({ error: 'Token inválido.' })
+  }
+
+  const { businessId } = req.body || {}
+  if (!businessId) return res.status(400).json({ error: 'Falta businessId.' })
+
+  try {
+    // Verificar que el email del token es admin del negocio
+    const bizSnap = await db.collection('businesses').doc(businessId).get()
+    if (!bizSnap.exists) return res.status(404).json({ error: 'Negocio no encontrado.' })
+
+    const biz = bizSnap.data()
+    if (!biz.adminEmails?.includes(decoded.email)) {
+      return res.status(403).json({ error: 'No tenés permiso para cancelar este negocio.' })
+    }
+
+    const mpId = biz.suscripcion?.mpId
+    if (!mpId) return res.status(400).json({ error: 'No se encontró la suscripción en MercadoPago.' })
+
+    // Cancelar en MercadoPago
+    const preApproval = new PreApproval(mp)
+    await preApproval.update({ id: mpId, body: { status: 'cancelled' } })
+
+    // Actualizar Firestore
+    const ahora = admin.firestore.FieldValue.serverTimestamp()
+    await db.collection('businesses').doc(businessId).update({
+      activo: false,
+      'suscripcion.estado': 'cancelada',
+      'suscripcion.actualizadoEn': ahora,
+    })
+
+    // Actualizar privado/suscripcion si existe
+    try {
+      await db.collection('businesses').doc(businessId)
+        .collection('privado').doc('suscripcion').update({
+          estado: 'cancelada', actualizadoEn: ahora,
+        })
+    } catch { /* puede no existir */ }
+
+    console.log('[cancelar-suscripcion] Cancelado:', businessId)
+    res.json({ ok: true })
+  } catch (err) {
+    console.error('[/cancelar-suscripcion] Error:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────────────
 //  POST /admin/linkear-negocio
 //  Crea manualmente la entrada userBusinessMap para negocios existentes
 //  Cuerpo: { email, businessId }
