@@ -8,6 +8,7 @@
 //    POST /webhook/pago          → MP notifica pago único (tarjeta)
 //    POST /crear-preferencia     → genera link de pago MP (uso interno)
 //    POST /upgrade-plan          → el negocio hace upgrade a LealFull
+//    POST /reactivar-plan        → el negocio reactiva un plan cancelado
 //    POST /cancelar-suscripcion  → el negocio cancela su plan
 //    POST /setup/crear-planes    → crea los 3 planes MP (una sola vez)
 //    GET  /planes                → devuelve IDs de los planes guardados
@@ -276,6 +277,13 @@ app.post('/webhook/suscripcion', async (req, res) => {
       return
     }
 
+    // ── Rama reactivación ─────────────────────────────────────────────
+    if (externalRef.startsWith('reactivar:')) {
+      const reactivacionId = externalRef.slice(10)
+      await procesarReactivacion({ reactivacionId, sub })
+      return
+    }
+
     // ── Rama registro nuevo ───────────────────────────────────────────
     const registroId = externalRef
     const registroRef = db
@@ -477,6 +485,35 @@ async function activarNegocio({ registro, registroId, sub }) {
   })
 }
 
+// ── Helper: email de reactivación completada ────────────────────────────
+async function enviarEmailReactivacion({ businessId, email, planClave }) {
+  const NOMBRE_PLAN = { lealcard: 'LealCard', lealorder: 'LealOrder', lealfull: 'LealFull' }
+  try {
+    await resend.emails.send({
+      from:    FROM_EMAIL,
+      to:      email,
+      subject: '¡Tu plan Lealteck está activo nuevamente! 🎉',
+      html: `
+        <div style="font-family:system-ui,sans-serif;max-width:520px;margin:0 auto;color:#1c1410">
+          <h1 style="color:#c47a3a">¡De vuelta en marcha!</h1>
+          <p>Tu plan <strong>${NOMBRE_PLAN[planClave] || planClave}</strong> fue reactivado exitosamente.</p>
+          <p>Tu panel y la app de tus clientes ya están disponibles.</p>
+          <p style="margin:20px 0">
+            <a href="https://${businessId}.lealteck.com"
+               style="background:#c47a3a;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:700">
+              Ir a mi panel →
+            </a>
+          </p>
+          <p style="color:#8b7355;font-size:0.8rem">Lealteck · Plataforma de fidelización para restaurantes y cafés</p>
+        </div>
+      `,
+    })
+    console.log('[email] Reactivación enviada a:', email)
+  } catch (err) {
+    console.error('[email] Error enviando reactivación:', err)
+  }
+}
+
 // ── Helper: procesar upgrade de plan ────────────────────────────────────
 async function procesarUpgrade({ upgradeId, sub }) {
   const upgradeRef = db.collection('platform').doc('upgrades').collection('items').doc(upgradeId)
@@ -545,6 +582,63 @@ async function procesarUpgrade({ upgradeId, sub }) {
     // El usuario canceló el pago del upgrade — solo marcamos el doc
     await upgradeRef.update({ estado: 'cancelado', actualizadoEn: ahora })
     console.log('[upgrade] Upgrade cancelado por el usuario:', upgradeId)
+  }
+}
+
+// ── Helper: procesar reactivación de plan ───────────────────────────────
+async function procesarReactivacion({ reactivacionId, sub }) {
+  const reactivRef = db.collection('platform').doc('reactivaciones').collection('items').doc(reactivacionId)
+  const reactivSnap = await reactivRef.get()
+  if (!reactivSnap.exists) {
+    console.warn('[reactivar] Doc no encontrado:', reactivacionId)
+    return
+  }
+
+  const reactiv = reactivSnap.data()
+  const ahora   = admin.firestore.FieldValue.serverTimestamp()
+
+  if (sub.status === 'authorized') {
+    const planConfig = PLANES_CONFIG.find(p => p.key === reactiv.planClave) || {}
+    const monto          = planConfig.auto_recurring?.transaction_amount || 0
+    const frecuencia     = planConfig.auto_recurring?.frequency || 1
+    const frecuenciaTipo = planConfig.auto_recurring?.frequency_type || 'months'
+    const planNombre     = planConfig.reason || reactiv.planClave
+
+    // Reactivar el negocio
+    await db.collection('businesses').doc(reactiv.businessId).update({
+      activo:                       true,
+      'suscripcion.mpId':           sub.id,
+      'suscripcion.planMpId':       sub.preapproval_plan_id,
+      'suscripcion.estado':         'activa',
+      'suscripcion.actualizadoEn':  ahora,
+    })
+
+    // Actualizar privado/suscripcion
+    await db.collection('businesses').doc(reactiv.businessId)
+      .collection('privado').doc('suscripcion').set({
+        mpId:          sub.id,
+        planMpId:      sub.preapproval_plan_id,
+        planClave:     reactiv.planClave,
+        planNombre,
+        monto,
+        frecuencia,
+        frecuenciaTipo,
+        estado:        'activa',
+        actualizadoEn: ahora,
+      }, { merge: true })
+
+    await reactivRef.update({ estado: 'completado', completadoEn: ahora, mpId: sub.id })
+    console.log('[reactivar] Negocio reactivado:', reactiv.businessId)
+
+    enviarEmailReactivacion({
+      businessId: reactiv.businessId,
+      email:      reactiv.email,
+      planClave:  reactiv.planClave,
+    })
+
+  } else if (['cancelled', 'paused'].includes(sub.status)) {
+    await reactivRef.update({ estado: 'cancelado', actualizadoEn: ahora })
+    console.log('[reactivar] Reactivación cancelada por usuario:', reactivacionId)
   }
 }
 
@@ -708,6 +802,83 @@ app.post('/upgrade-plan', async (req, res) => {
     res.json({ ok: true, urlSuscripcion: suscripcion.init_point })
   } catch (err) {
     console.error('[/upgrade-plan] Error:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────────────
+//  POST /reactivar-plan
+//  El dueño de un negocio cancelado reactiva su suscripción desde el panel.
+//  Header: Authorization: Bearer <firebase-id-token>
+//  Cuerpo: { businessId }
+//  Responde: { ok: true, urlSuscripcion }  → frontend redirige ahí
+// ─────────────────────────────────────────────────────────────────────
+app.post('/reactivar-plan', async (req, res) => {
+  const authHeader = req.headers['authorization'] || ''
+  const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null
+  if (!idToken) return res.status(401).json({ error: 'Token requerido.' })
+
+  let decoded
+  try {
+    decoded = await admin.auth().verifyIdToken(idToken)
+  } catch {
+    return res.status(401).json({ error: 'Token inválido.' })
+  }
+
+  const { businessId } = req.body || {}
+  if (!businessId) return res.status(400).json({ error: 'Falta businessId.' })
+
+  try {
+    const bizSnap = await db.collection('businesses').doc(businessId).get()
+    if (!bizSnap.exists) return res.status(404).json({ error: 'Negocio no encontrado.' })
+
+    const biz = bizSnap.data()
+    if (!biz.adminEmails?.includes(decoded.email)) {
+      return res.status(403).json({ error: 'No tenés permiso para modificar este negocio.' })
+    }
+
+    if (biz.activo === true) {
+      return res.status(400).json({ error: 'El negocio ya está activo.' })
+    }
+
+    const planClave = biz.plan || 'lealcard'
+
+    // Obtener el planId de MP
+    const planDoc = await db.collection('platform').doc('planes').get()
+    const planId  = planDoc.exists ? planDoc.data()[planClave] : null
+    if (!planId) return res.status(500).json({ error: `Plan "${planClave}" no configurado.` })
+
+    const planConfig = PLANES_CONFIG.find(p => p.key === planClave) || {}
+
+    // Guardar registro de reactivación
+    const reactivRef = db.collection('platform').doc('reactivaciones').collection('items').doc()
+    const reactivacionId = reactivRef.id
+    await reactivRef.set({
+      businessId,
+      email:     decoded.email,
+      planClave,
+      estado:    'pendiente_pago',
+      creadoEn:  admin.firestore.FieldValue.serverTimestamp(),
+    })
+
+    // Crear nueva suscripción MP
+    const preApproval = new PreApproval(mp)
+    const suscripcion = await preApproval.create({
+      body: {
+        preapproval_plan_id: planId,
+        reason:              `Reactivación ${planConfig.reason || planClave}`,
+        external_reference:  `reactivar:${reactivacionId}`,
+        payer_email:         decoded.email,
+        back_url:            `https://${businessId}.lealteck.com`,
+      },
+    })
+
+    await reactivRef.update({ urlSuscripcion: suscripcion.init_point, mpId: suscripcion.id })
+
+    console.log('[reactivar-plan] Reactivación iniciada:', businessId, 'plan:', planClave)
+    res.json({ ok: true, urlSuscripcion: suscripcion.init_point })
+  } catch (err) {
+    console.error('[/reactivar-plan] Error:', err)
     res.status(500).json({ error: err.message })
   }
 })
