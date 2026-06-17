@@ -861,15 +861,20 @@ app.post('/reactivar-plan', async (req, res) => {
       creadoEn:  admin.firestore.FieldValue.serverTimestamp(),
     })
 
-    // Crear nueva suscripción MP
+    // Crear suscripción de reactivación SIN trial y SIN plan_id.
+    // Usamos preapproval_plan_id en el /registro (nuevo negocio) porque ahí
+    // sí queremos el trial de 7 días. Acá creamos la suscripción directamente
+    // con los campos del plan para poder omitir free_trial — el trial ya fue
+    // usado, darlo de nuevo dejaría al negocio activo sin cobro hasta día 7.
+    const { free_trial: _ft, ...autoRecurringSinTrial } = planConfig.auto_recurring || {}
     const preApproval = new PreApproval(mp)
     const suscripcion = await preApproval.create({
       body: {
-        preapproval_plan_id: planId,
-        reason:              `Reactivación ${planConfig.reason || planClave}`,
-        external_reference:  `reactivar:${reactivacionId}`,
-        payer_email:         decoded.email,
-        back_url:            `https://${businessId}.lealteck.com`,
+        reason:             `Reactivación ${planConfig.reason || planClave}`,
+        external_reference: `reactivar:${reactivacionId}`,
+        payer_email:        decoded.email,
+        back_url:           `https://${businessId}.lealteck.com`,
+        auto_recurring:     autoRecurringSinTrial,
       },
     })
 
