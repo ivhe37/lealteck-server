@@ -212,18 +212,20 @@ app.post('/registro', async (req, res) => {
     }
     await ref.set(registro)
 
-    // ── Construir URL de suscripción MP
-    //    El external_reference lo armamos con registroId para reconocerlo en el webhook
-    const registroId = ref.id
-    const mpPlan     = new PreApprovalPlan(mp)
-    const planData   = await mpPlan.get({ preApprovalPlanId: planId })
-
-    // La URL de suscripción pública del plan
-    const init_url = planData.init_point || planData.collector_info?.register_idempotency_key
-      ? `https://www.mercadopago.com.pe/subscriptions/checkout?preapproval_plan_id=${planId}&external_reference=${registroId}&payer_email=${encodeURIComponent(email)}`
-      : `https://www.mercadopago.com.pe/subscriptions/checkout?preapproval_plan_id=${planId}`
-
-    const urlSuscripcion = `https://www.mercadopago.com.pe/subscriptions/checkout?preapproval_plan_id=${planId}&external_reference=${registroId}&payer_email=${encodeURIComponent(email)}`
+    // ── Crear suscripción MP via API (para que external_reference quede en el objeto)
+    //    NO usar la URL pública del plan — esa ignora external_reference
+    const registroId  = ref.id
+    const preApproval = new PreApproval(mp)
+    const suscripcion = await preApproval.create({
+      body: {
+        preapproval_plan_id: planId,
+        reason:              `Suscripción Lealteck – ${plan}`,
+        external_reference:  registroId,
+        payer_email:         email,
+        back_url:            'https://lealteck.com/gracias',
+      },
+    })
+    const urlSuscripcion = suscripcion.init_point
 
     // Actualizamos el registro con su propio ID y la URL generada
     await ref.update({ registroId, urlSuscripcion })
@@ -542,6 +544,108 @@ app.post('/admin/linkear-negocio', async (req, res) => {
     res.json({ ok: true, emailKey, businessId })
   } catch (err) {
     console.error('[/admin/linkear-negocio] Error:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────────────
+//  POST /admin/activar-registro
+//  Activa manualmente un negocio dado su registroId y el ID de suscripción MP
+//  Cuerpo: { registroId, mpSubscriptionId }
+//  Header: x-admin-token: <MP_ACCESS_TOKEN>
+// ─────────────────────────────────────────────────────────────────────
+app.post('/admin/activar-registro', async (req, res) => {
+  const auth = req.headers['x-admin-token']
+  if (auth !== process.env.MP_ACCESS_TOKEN) {
+    return res.status(401).json({ error: 'No autorizado.' })
+  }
+
+  const { registroId, mpSubscriptionId } = req.body || {}
+  if (!registroId || !mpSubscriptionId) {
+    return res.status(400).json({ error: 'Faltan registroId y/o mpSubscriptionId.' })
+  }
+
+  try {
+    const registroRef  = db.collection('platform').doc('registros').collection('items').doc(registroId)
+    const registroSnap = await registroRef.get()
+    if (!registroSnap.exists) return res.status(404).json({ error: 'Registro no encontrado.' })
+
+    const preApproval = new PreApproval(mp)
+    const sub = await preApproval.get({ id: mpSubscriptionId })
+
+    await activarNegocio({ registro: registroSnap.data(), registroId, sub })
+    console.log('[admin/activar-registro] Activado:', registroId)
+    res.json({ ok: true, registroId, mpSubscriptionId })
+  } catch (err) {
+    console.error('[admin/activar-registro] Error:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────────────
+//  GET /pedidos-pendientes/:businessId
+//  Devuelve pedidos con estado 'nuevo' o 'preparando' de un negocio.
+//  Usado por tasta-contabilidad para importar pedidos y emitir boletas.
+//  Header: x-bridge-token: <BRIDGE_TOKEN env var>
+//  Responde: { ok: true, pedidos: [...] }
+// ─────────────────────────────────────────────────────────────────────
+app.get('/pedidos-pendientes/:businessId', async (req, res) => {
+  const token = req.headers['x-bridge-token']
+  if (!token || token !== process.env.BRIDGE_TOKEN) {
+    return res.status(401).json({ error: 'No autorizado.' })
+  }
+
+  const { businessId } = req.params
+  if (!businessId || businessId.includes('/')) {
+    return res.status(400).json({ error: 'businessId inválido.' })
+  }
+
+  try {
+    const snap = await db
+      .collection('businesses').doc(businessId)
+      .collection('pedidos')
+      .where('estado', 'in', ['nuevo', 'preparando'])
+      .orderBy('creadoEn', 'desc')
+      .limit(100)
+      .get()
+
+    const pedidos = snap.docs.map(d => ({
+      id: d.id,
+      ...d.data(),
+      // Firestore Timestamps → ISO string para JSON
+      creadoEn: d.data().creadoEn?.toDate?.()?.toISOString() ?? null,
+    }))
+
+    res.json({ ok: true, pedidos })
+  } catch (err) {
+    console.error('[/pedidos-pendientes] Error:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────────────
+//  PATCH /pedidos-pendientes/:businessId/:pedidoId/marcar-procesado
+//  Marca un pedido como 'procesado_contabilidad' para no reimportarlo.
+//  Header: x-bridge-token: <BRIDGE_TOKEN env var>
+// ─────────────────────────────────────────────────────────────────────
+app.patch('/pedidos-pendientes/:businessId/:pedidoId/marcar-procesado', async (req, res) => {
+  const token = req.headers['x-bridge-token']
+  if (!token || token !== process.env.BRIDGE_TOKEN) {
+    return res.status(401).json({ error: 'No autorizado.' })
+  }
+
+  const { businessId, pedidoId } = req.params
+  try {
+    await db
+      .collection('businesses').doc(businessId)
+      .collection('pedidos').doc(pedidoId)
+      .update({
+        procesadoContabilidad: true,
+        procesadoEn: admin.firestore.FieldValue.serverTimestamp(),
+      })
+    res.json({ ok: true })
+  } catch (err) {
+    console.error('[/marcar-procesado] Error:', err)
     res.status(500).json({ error: err.message })
   }
 })
