@@ -323,6 +323,13 @@ async function activarNegocio({ registro, registroId, sub }) {
 
   const ahora = admin.firestore.FieldValue.serverTimestamp()
 
+  // Buscar config del plan para saber monto y frecuencia
+  const planConfig = PLANES_CONFIG.find(p => p.key === registro.plan) || {}
+  const monto      = planConfig.auto_recurring?.transaction_amount || 0
+  const frecuencia = planConfig.auto_recurring?.frequency || 1
+  const frecuenciaTipo = planConfig.auto_recurring?.frequency_type || 'months'
+  const planNombre = planConfig.reason || registro.plan
+
   await db.collection('businesses').doc(businessId).set({
     id:           businessId,
     nombre:       registro.nombre,
@@ -334,12 +341,27 @@ async function activarNegocio({ registro, registroId, sub }) {
     suscripcion: {
       mpId:         sub.id,
       planMpId:     sub.preapproval_plan_id,
-      estado:       'activo',
+      estado:       'activa',
       creadoEn:     ahora,
       actualizadoEn: ahora,
     },
     creadoEn: ahora,
   }, { merge: true })
+
+  // Crear privado/suscripcion para que el panel del negocio muestre el plan y el botón de cancelar
+  await db.collection('businesses').doc(businessId)
+    .collection('privado').doc('suscripcion').set({
+      mpId:         sub.id,
+      planMpId:     sub.preapproval_plan_id,
+      planClave:    registro.plan,
+      planNombre,
+      monto,
+      frecuencia,
+      frecuenciaTipo,
+      estado:       'activa',
+      creadoEn:     ahora,
+      actualizadoEn: ahora,
+    })
 
   await registroRef.update({
     estado:     'activo',
@@ -490,9 +512,15 @@ app.post('/cancelar-suscripcion', async (req, res) => {
     const mpId = biz.suscripcion?.mpId
     if (!mpId) return res.status(400).json({ error: 'No se encontró la suscripción en MercadoPago.' })
 
-    // Cancelar en MercadoPago
+    // Cancelar en MercadoPago (ignorar si ya estaba cancelada)
     const preApproval = new PreApproval(mp)
-    await preApproval.update({ id: mpId, body: { status: 'cancelled' } })
+    try {
+      await preApproval.update({ id: mpId, body: { status: 'cancelled' } })
+    } catch (mpErr) {
+      const msg = mpErr?.message || ''
+      if (!msg.toLowerCase().includes('cancelled')) throw mpErr
+      // Ya estaba cancelada en MP — seguimos para actualizar Firestore
+    }
 
     // Actualizar Firestore
     const ahora = admin.firestore.FieldValue.serverTimestamp()
