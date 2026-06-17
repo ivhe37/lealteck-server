@@ -7,6 +7,8 @@
 //    POST /webhook/suscripcion   → MP notifica cambio de suscripción
 //    POST /webhook/pago          → MP notifica pago único (tarjeta)
 //    POST /crear-preferencia     → genera link de pago MP (uso interno)
+//    POST /upgrade-plan          → el negocio hace upgrade a LealFull
+//    POST /cancelar-suscripcion  → el negocio cancela su plan
 //    POST /setup/crear-planes    → crea los 3 planes MP (una sola vez)
 //    GET  /planes                → devuelve IDs de los planes guardados
 // ════════════════════════════════════════════════════════════════════════
@@ -260,13 +262,22 @@ app.post('/webhook/suscripcion', async (req, res) => {
 
     console.log('[webhook/suscripcion] status:', sub.status, 'external_ref:', sub.external_reference)
 
-    // external_reference = registroId guardado en /registro
-    const registroId = sub.external_reference
-    if (!registroId) {
+    // external_reference = registroId (nuevo negocio) o 'upgrade:{upgradeId}'
+    const externalRef = sub.external_reference
+    if (!externalRef) {
       console.warn('[webhook/suscripcion] Sin external_reference, ignorando.')
       return
     }
 
+    // ── Rama upgrade ──────────────────────────────────────────────────
+    if (externalRef.startsWith('upgrade:')) {
+      const upgradeId = externalRef.slice(8)
+      await procesarUpgrade({ upgradeId, sub })
+      return
+    }
+
+    // ── Rama registro nuevo ───────────────────────────────────────────
+    const registroId = externalRef
     const registroRef = db
       .collection('platform').doc('registros')
       .collection('items').doc(registroId)
@@ -298,6 +309,40 @@ app.post('/webhook/suscripcion', async (req, res) => {
     console.error('[webhook/suscripcion] Error:', err)
   }
 })
+
+// ── Helper: email de upgrade completado ──────────────────────────────────
+async function enviarEmailUpgrade({ businessId, email, planAnterior }) {
+  const NOMBRE_PLAN = { lealcard: 'LealCard', lealorder: 'LealOrder' }
+  try {
+    await resend.emails.send({
+      from:    FROM_EMAIL,
+      to:      email,
+      subject: '¡Tu plan fue actualizado a LealFull! 🚀',
+      html: `
+        <div style="font-family:system-ui,sans-serif;max-width:520px;margin:0 auto;color:#1c1410">
+          <h1 style="color:#c47a3a">¡Ya tenés LealFull!</h1>
+          <p>Tu plan fue actualizado de <strong>${NOMBRE_PLAN[planAnterior] || planAnterior}</strong>
+             a <strong>LealFull</strong> exitosamente.</p>
+          <p>Ahora tenés acceso a <strong>sellos y fidelización</strong>
+             + <strong>carta digital y pedidos</strong> en un solo panel.</p>
+          <p style="margin:20px 0">
+            <a href="https://${businessId}.lealteck.com"
+               style="background:#c47a3a;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:700">
+              Ir a mi panel →
+            </a>
+          </p>
+          <p style="color:#8b7355;font-size:0.9rem">
+            Tu suscripción anterior fue cancelada automáticamente — solo se cobra el plan LealFull.
+          </p>
+          <p style="color:#8b7355;font-size:0.8rem">Lealteck · Plataforma de fidelización para restaurantes y cafés</p>
+        </div>
+      `,
+    })
+    console.log('[email] Upgrade enviado a:', email)
+  } catch (err) {
+    console.error('[email] Error enviando upgrade:', err)
+  }
+}
 
 // ── Helper: agregar dominio a Firebase Auth authorized domains ──────────
 async function agregarDominioAuth(dominio) {
@@ -432,6 +477,77 @@ async function activarNegocio({ registro, registroId, sub }) {
   })
 }
 
+// ── Helper: procesar upgrade de plan ────────────────────────────────────
+async function procesarUpgrade({ upgradeId, sub }) {
+  const upgradeRef = db.collection('platform').doc('upgrades').collection('items').doc(upgradeId)
+  const upgradeSnap = await upgradeRef.get()
+  if (!upgradeSnap.exists) {
+    console.warn('[upgrade] Upgrade no encontrado:', upgradeId)
+    return
+  }
+
+  const upgrade = upgradeSnap.data()
+  const ahora   = admin.firestore.FieldValue.serverTimestamp()
+
+  if (sub.status === 'authorized') {
+    // Cancelar suscripción anterior (no bloquear si falla)
+    if (upgrade.mpIdAnterior) {
+      try {
+        const preApproval = new PreApproval(mp)
+        await preApproval.update({ id: upgrade.mpIdAnterior, body: { status: 'cancelled' } })
+        console.log('[upgrade] Suscripción anterior cancelada:', upgrade.mpIdAnterior)
+      } catch (err) {
+        const msg = err?.message || ''
+        if (!msg.toLowerCase().includes('cancelled')) {
+          console.error('[upgrade] Error cancelando suscripción anterior:', err.message)
+        }
+      }
+    }
+
+    const planConfig = PLANES_CONFIG.find(p => p.key === 'lealfull') || {}
+    const monto          = planConfig.auto_recurring?.transaction_amount || 120
+    const frecuencia     = planConfig.auto_recurring?.frequency || 1
+    const frecuenciaTipo = planConfig.auto_recurring?.frequency_type || 'months'
+
+    // Actualizar el negocio con el nuevo plan
+    await db.collection('businesses').doc(upgrade.businessId).update({
+      plan:                         'lealfull',
+      'suscripcion.mpId':           sub.id,
+      'suscripcion.planMpId':       sub.preapproval_plan_id,
+      'suscripcion.estado':         'activa',
+      'suscripcion.actualizadoEn':  ahora,
+    })
+
+    // Reemplazar privado/suscripcion con datos del nuevo plan
+    await db.collection('businesses').doc(upgrade.businessId)
+      .collection('privado').doc('suscripcion').set({
+        mpId:          sub.id,
+        planMpId:      sub.preapproval_plan_id,
+        planClave:     'lealfull',
+        planNombre:    'LealFull – Sellos + Carta + Pedidos',
+        monto,
+        frecuencia,
+        frecuenciaTipo,
+        estado:        'activa',
+        actualizadoEn: ahora,
+      }, { merge: true })
+
+    await upgradeRef.update({ estado: 'completado', completadoEn: ahora, mpId: sub.id })
+    console.log('[upgrade] Plan actualizado a lealfull:', upgrade.businessId)
+
+    enviarEmailUpgrade({
+      businessId:   upgrade.businessId,
+      email:        upgrade.email,
+      planAnterior: upgrade.planAnterior,
+    })
+
+  } else if (['cancelled', 'paused'].includes(sub.status)) {
+    // El usuario canceló el pago del upgrade — solo marcamos el doc
+    await upgradeRef.update({ estado: 'cancelado', actualizadoEn: ahora })
+    console.log('[upgrade] Upgrade cancelado por el usuario:', upgradeId)
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 //  POST /webhook/pago
 //  Notificaciones de pagos únicos (tarjeta, no suscripción)
@@ -516,6 +632,82 @@ app.get('/planes', async (_req, res) => {
     if (!snap.exists) return res.json({ planes: null, mensaje: 'Ejecutá /setup/crear-planes primero.' })
     res.json({ planes: snap.data() })
   } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────────────
+//  POST /upgrade-plan
+//  El dueño del negocio hace upgrade a LealFull desde su panel.
+//  Header: Authorization: Bearer <firebase-id-token>
+//  Cuerpo: { businessId }
+//  Responde: { ok: true, urlSuscripcion }  → frontend redirige ahí
+// ─────────────────────────────────────────────────────────────────────
+app.post('/upgrade-plan', async (req, res) => {
+  const authHeader = req.headers['authorization'] || ''
+  const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null
+  if (!idToken) return res.status(401).json({ error: 'Token requerido.' })
+
+  let decoded
+  try {
+    decoded = await admin.auth().verifyIdToken(idToken)
+  } catch {
+    return res.status(401).json({ error: 'Token inválido.' })
+  }
+
+  const { businessId } = req.body || {}
+  if (!businessId) return res.status(400).json({ error: 'Falta businessId.' })
+
+  try {
+    // Verificar que el email del token es admin del negocio
+    const bizSnap = await db.collection('businesses').doc(businessId).get()
+    if (!bizSnap.exists) return res.status(404).json({ error: 'Negocio no encontrado.' })
+
+    const biz = bizSnap.data()
+    if (!biz.adminEmails?.includes(decoded.email)) {
+      return res.status(403).json({ error: 'No tenés permiso para modificar este negocio.' })
+    }
+
+    if (biz.plan === 'lealfull') {
+      return res.status(400).json({ error: 'Ya estás en el plan LealFull.' })
+    }
+
+    // Obtener el planId de lealfull guardado en Firestore
+    const planDoc = await db.collection('platform').doc('planes').get()
+    const planId  = planDoc.exists ? planDoc.data()['lealfull'] : null
+    if (!planId) return res.status(500).json({ error: 'Plan LealFull no configurado. Contactá a soporte.' })
+
+    // Guardar el registro del upgrade
+    const upgradeRef = db.collection('platform').doc('upgrades').collection('items').doc()
+    const upgradeId  = upgradeRef.id
+    await upgradeRef.set({
+      businessId,
+      email:        decoded.email,
+      planAnterior: biz.plan,
+      planNuevo:    'lealfull',
+      mpIdAnterior: biz.suscripcion?.mpId || null,
+      estado:       'pendiente_pago',
+      creadoEn:     admin.firestore.FieldValue.serverTimestamp(),
+    })
+
+    // Crear nueva suscripción MP para lealfull
+    const preApproval = new PreApproval(mp)
+    const suscripcion = await preApproval.create({
+      body: {
+        preapproval_plan_id: planId,
+        reason:              'Upgrade a LealFull – Sellos + Carta + Pedidos',
+        external_reference:  `upgrade:${upgradeId}`,
+        payer_email:         decoded.email,
+        back_url:            `https://${businessId}.lealteck.com`,
+      },
+    })
+
+    await upgradeRef.update({ urlSuscripcion: suscripcion.init_point, mpId: suscripcion.id })
+
+    console.log('[upgrade-plan] Upgrade iniciado:', businessId, '→ lealfull, upgradeId:', upgradeId)
+    res.json({ ok: true, urlSuscripcion: suscripcion.init_point })
+  } catch (err) {
+    console.error('[/upgrade-plan] Error:', err)
     res.status(500).json({ error: err.message })
   }
 })
