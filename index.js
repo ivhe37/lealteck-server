@@ -299,6 +299,46 @@ app.post('/webhook/suscripcion', async (req, res) => {
   }
 })
 
+// ── Helper: agregar dominio a Firebase Auth authorized domains ──────────
+async function agregarDominioAuth(dominio) {
+  try {
+    const projectId = process.env.FIREBASE_PROJECT_ID
+    const token = await admin.app().options.credential.getAccessToken()
+    const accessToken = token.access_token
+
+    const configUrl = `https://identitytoolkit.googleapis.com/admin/v2/projects/${projectId}/config`
+
+    // Obtener config actual para no pisar dominios existentes
+    const getRes = await fetch(configUrl, {
+      headers: { 'Authorization': `Bearer ${accessToken}` },
+    })
+    if (!getRes.ok) throw new Error(`GET config: ${getRes.status} ${await getRes.text()}`)
+    const config = await getRes.json()
+
+    const dominiosActuales = config.authorizedDomains || []
+    if (dominiosActuales.includes(dominio)) {
+      console.log('[agregarDominioAuth] Ya existe:', dominio)
+      return
+    }
+
+    // Agregar el nuevo dominio
+    const patchRes = await fetch(`${configUrl}?updateMask=authorizedDomains`, {
+      method: 'PATCH',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ authorizedDomains: [...dominiosActuales, dominio] }),
+    })
+    if (!patchRes.ok) throw new Error(`PATCH config: ${patchRes.status} ${await patchRes.text()}`)
+
+    console.log('[agregarDominioAuth] Dominio agregado:', dominio)
+  } catch (err) {
+    // No bloquear la activación si esto falla — solo loguear
+    console.error('[agregarDominioAuth] Error:', err.message)
+  }
+}
+
 // ── Helper: crear / activar negocio en Firestore ──────────────────────
 async function activarNegocio({ registro, registroId, sub }) {
   const registroRef = db
@@ -377,6 +417,9 @@ async function activarNegocio({ registro, registroId, sub }) {
       businessId,
       email: registro.email,
     })
+
+  // Agregar dominio a Firebase Auth (no bloqueante — no debe frenar la activación)
+  agregarDominioAuth(`${businessId}.lealteck.com`)
 
   console.log('[activarNegocio] Negocio activado:', businessId)
 
