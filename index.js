@@ -18,6 +18,7 @@
 
 const express   = require('express')
 const cors      = require('cors')
+const crypto    = require('crypto')
 const admin     = require('firebase-admin')
 const { MercadoPagoConfig, PreApprovalPlan, PreApproval, Preference } = require('mercadopago')
 const { Resend } = require('resend')
@@ -60,6 +61,43 @@ app.use(cors({
 }))
 
 app.use(express.json())
+
+// ─────────────────────────────────────────────────────────────────────
+//  VERIFICACIÓN DE FIRMA DE WEBHOOKS DE MERCADOPAGO
+//  MP envía x-signature: "ts=<epoch>,v1=<hmac-sha256>"
+//  y x-request-id con cada notificación.
+//  Si MP_WEBHOOK_SECRET no está configurado, se loguea una advertencia
+//  y se deja pasar (modo degradado para no romper en staging).
+// ─────────────────────────────────────────────────────────────────────
+function verificarFirmaMP(req) {
+  const secret = process.env.MP_WEBHOOK_SECRET
+  if (!secret) {
+    console.warn('[webhook] MP_WEBHOOK_SECRET no configurado — firma no verificada')
+    return true // degradado: no bloquear si aún no se configuró el secret
+  }
+
+  const signature  = req.headers['x-signature']   || ''
+  const requestId  = req.headers['x-request-id']  || ''
+  if (!signature || !requestId) return false
+
+  // x-signature tiene el formato "ts=1234567890,v1=abc123..."
+  const parts = Object.fromEntries(
+    signature.split(',').map(p => p.trim().split('=', 2))
+  )
+  const ts = parts['ts']
+  const v1 = parts['v1']
+  if (!ts || !v1) return false
+
+  const dataId   = req.body?.data?.id ?? ''
+  const manifest = `id:${dataId};request-id:${requestId};ts:${ts};`
+
+  const expected = crypto
+    .createHmac('sha256', secret)
+    .update(manifest)
+    .digest('hex')
+
+  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(v1))
+}
 
 // ─────────────────────────────────────────────────────────────────────
 //  PLANES (definidos aquí para usarlos en setup y en /planes)
@@ -263,6 +301,14 @@ app.post('/registro', async (req, res) => {
 //  Docs: https://www.mercadopago.com.ar/developers/es/docs/subscriptions/additional-content/notifications
 // ─────────────────────────────────────────────────────────────────────
 app.post('/webhook/suscripcion', async (req, res) => {
+  // Verificar firma ANTES de responder 200 — si la firma es inválida,
+  // respondemos 400 para que MP reintente (si fuera un error transitorio)
+  // o descarte (si es un intento externo).
+  if (!verificarFirmaMP(req)) {
+    console.warn('[webhook/suscripcion] Firma inválida — rechazado')
+    return res.sendStatus(400)
+  }
+
   // Responder 200 DE INMEDIATO – MP reintenta si no recibe respuesta rápida
   res.sendStatus(200)
 
@@ -661,6 +707,10 @@ async function procesarReactivacion({ reactivacionId, sub }) {
 //  Notificaciones de pagos únicos (tarjeta, no suscripción)
 // ─────────────────────────────────────────────────────────────────────
 app.post('/webhook/pago', async (req, res) => {
+  if (!verificarFirmaMP(req)) {
+    console.warn('[webhook/pago] Firma inválida — rechazado')
+    return res.sendStatus(400)
+  }
   res.sendStatus(200)
   const { type, data } = req.body || {}
   console.log('[webhook/pago] type:', type, 'id:', data?.id)
