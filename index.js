@@ -1461,12 +1461,16 @@ app.get('/pedidos-pendientes/:businessId', async (req, res) => {
       .limit(100)
       .get()
 
-    const pedidos = snap.docs.map(d => ({
-      id: d.id,
-      ...d.data(),
-      // Firestore Timestamps → ISO string para JSON
-      creadoEn: d.data().creadoEn?.toDate?.()?.toISOString() ?? null,
-    }))
+    const pedidos = snap.docs
+      .map(d => ({
+        id: d.id,
+        ...d.data(),
+        // Firestore Timestamps → ISO string para JSON
+        creadoEn: d.data().creadoEn?.toDate?.()?.toISOString() ?? null,
+        actualizadoEn: d.data().actualizadoEn?.toDate?.()?.toISOString() ?? null,
+      }))
+      // Excluir los que el sistema contable ya procesó
+      .filter(p => !p.procesadoContabilidad)
 
     res.json({ ok: true, pedidos })
   } catch (err) {
