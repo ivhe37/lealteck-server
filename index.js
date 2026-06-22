@@ -139,13 +139,25 @@ const PLANES_CONFIG = [
     },
     back_url: 'https://lealteck.com/gracias',
   },
+  {
+    key:           'lealpro',
+    reason:        'LealPro – Fidelización + Pedidos + Inventario + Contabilidad SUNAT',
+    auto_recurring: {
+      frequency:      1,
+      frequency_type: 'months',
+      transaction_amount: 180,
+      currency_id:   'PEN',
+      free_trial: { frequency: 7, frequency_type: 'days' },
+    },
+    back_url: 'https://lealteck.com/gracias',
+  },
 ]
 
 // ─────────────────────────────────────────────────────────────────────
 //  EMAILS
 // ─────────────────────────────────────────────────────────────────────
 async function enviarEmailBienvenida({ nombre, email, plan, businessId }) {
-  const NOMBRE_PLAN = { lealcard: 'LealCard', lealorder: 'LealOrder', lealfull: 'LealFull' }
+  const NOMBRE_PLAN = { lealcard: 'LealCard', lealorder: 'LealOrder', lealfull: 'LealFull', lealpro: 'LealPro' }
   try {
     await resend.emails.send({
       from:    FROM_EMAIL,
@@ -416,7 +428,7 @@ app.post('/webhook/suscripcion', async (req, res) => {
 
 // ── Helper: email de upgrade completado ──────────────────────────────────
 async function enviarEmailUpgrade({ businessId, email, planAnterior }) {
-  const NOMBRE_PLAN = { lealcard: 'LealCard', lealorder: 'LealOrder' }
+  const NOMBRE_PLAN = { lealcard: 'LealCard', lealorder: 'LealOrder', lealfull: 'LealFull', lealpro: 'LealPro' }
   try {
     await resend.emails.send({
       from:    FROM_EMAIL,
@@ -685,7 +697,7 @@ async function procesarReferido({ referidorId, nuevoNegocioId, nuevoNegocioNombr
 
 // ── Helper: email de reactivación completada ────────────────────────────
 async function enviarEmailReactivacion({ businessId, email, planClave }) {
-  const NOMBRE_PLAN = { lealcard: 'LealCard', lealorder: 'LealOrder', lealfull: 'LealFull' }
+  const NOMBRE_PLAN = { lealcard: 'LealCard', lealorder: 'LealOrder', lealfull: 'LealFull', lealpro: 'LealPro' }
   try {
     await resend.emails.send({
       from:    FROM_EMAIL,
@@ -914,6 +926,33 @@ app.post('/setup/crear-planes', async (req, res) => {
     res.json({ ok: true, planes: resultados })
   } catch (err) {
     console.error('[/setup/crear-planes] Error:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────────────
+//  POST /setup/crear-plan-nuevo
+//  Crea UN solo plan en MP (para agregar nuevos planes sin recrear todos)
+//  Body: { key: 'lealpro' }
+// ─────────────────────────────────────────────────────────────────────
+app.post('/setup/crear-plan-nuevo', async (req, res) => {
+  const auth = req.headers['x-admin-token']
+  if (auth !== process.env.MP_ACCESS_TOKEN) {
+    return res.status(401).json({ error: 'No autorizado.' })
+  }
+  const { key } = req.body || {}
+  const config = PLANES_CONFIG.find(p => p.key === key)
+  if (!config) return res.status(400).json({ error: `Plan "${key}" no existe en PLANES_CONFIG.` })
+
+  try {
+    const mpPlan = new PreApprovalPlan(mp)
+    const { key: _k, ...body } = config
+    const plan = await mpPlan.create({ body })
+    await db.collection('platform').doc('planes').set({ [key]: plan.id }, { merge: true })
+    console.log(`[setup] Plan "${key}" creado: ${plan.id}`)
+    res.json({ ok: true, key, planId: plan.id })
+  } catch (err) {
+    console.error('[/setup/crear-plan-nuevo] Error:', err)
     res.status(500).json({ error: err.message })
   }
 })
