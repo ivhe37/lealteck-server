@@ -357,10 +357,17 @@ app.post('/webhook/suscripcion', async (req, res) => {
       return
     }
 
-    // ── Rama upgrade ──────────────────────────────────────────────────
+    // ── Rama upgrade (legacy — mantener para suscripciones anteriores) ──
     if (externalRef.startsWith('upgrade:')) {
       const upgradeId = externalRef.slice(8)
       await procesarUpgrade({ upgradeId, sub })
+      return
+    }
+
+    // ── Rama cambio de plan (nuevo — reemplaza upgrade para los 9 planes)
+    if (externalRef.startsWith('cambio:')) {
+      const cambioId = externalRef.slice(7)
+      await procesarCambioPlan({ cambioId, sub })
       return
     }
 
@@ -985,6 +992,217 @@ app.post('/reactivar-plan', async (req, res) => {
     res.json({ ok: true, urlSuscripcion: suscripcion.init_point })
   } catch (err) {
     console.error('[/reactivar-plan] Error:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ── Helper: procesar cambio de plan (generalizado) ─────────────────────
+//  Maneja cualquier cambio entre los 9 planes: lealcard↔lealorder↔lealfull
+//  y/o mensual↔trimestral↔anual.
+async function procesarCambioPlan({ cambioId, sub }) {
+  const cambioRef = db.collection('platform').doc('cambios').collection('items').doc(cambioId)
+  const cambioSnap = await cambioRef.get()
+  if (!cambioSnap.exists) {
+    console.warn('[cambio-plan] Doc no encontrado:', cambioId)
+    return
+  }
+
+  const cambio = cambioSnap.data()
+  const ahora  = admin.firestore.FieldValue.serverTimestamp()
+
+  if (sub.status === 'authorized') {
+    // Cancelar suscripción anterior en MP (sin bloquear si ya estaba cancelada)
+    if (cambio.mpIdAnterior) {
+      try {
+        const preApproval = new PreApproval(mp)
+        await preApproval.update({ id: cambio.mpIdAnterior, body: { status: 'cancelled' } })
+        console.log('[cambio-plan] Suscripción anterior cancelada:', cambio.mpIdAnterior)
+      } catch (err) {
+        const msg = err?.message || ''
+        if (!msg.toLowerCase().includes('cancelled')) {
+          console.error('[cambio-plan] Error cancelando suscripción anterior:', err.message)
+        }
+      }
+    }
+
+    // Leer datos del nuevo plan desde Firestore (platform/planes)
+    const planDoc  = await db.collection('platform').doc('planes').get()
+    const planData = planDoc.exists ? planDoc.data()[cambio.nuevoPlanClave] : null
+    const monto          = typeof planData === 'object' ? (planData?.monto || 0) : 0
+    const frecuencia     = typeof planData === 'object' ? (planData?.frecuencia || 1) : 1
+    const frecuenciaTipo = typeof planData === 'object' ? (planData?.frecuenciaTipo || 'months') : 'months'
+    const planNombre     = typeof planData === 'object' ? (planData?.nombre || cambio.nuevoPlanClave) : cambio.nuevoPlanClave
+
+    // Familia base del nuevo plan (lealcard | lealorder | lealfull)
+    const familiaBase = cambio.nuevoPlanClave.replace(/-mensual|-trimestral|-anual/, '')
+
+    // Actualizar documento principal del negocio
+    await db.collection('businesses').doc(cambio.businessId).update({
+      plan:                        familiaBase,
+      'suscripcion.mpId':          sub.id,
+      'suscripcion.planMpId':      sub.preapproval_plan_id,
+      'suscripcion.estado':        'activa',
+      'suscripcion.actualizadoEn': ahora,
+    })
+
+    // Reemplazar privado/suscripcion con datos del nuevo plan
+    await db.collection('businesses').doc(cambio.businessId)
+      .collection('privado').doc('suscripcion').set({
+        mpId:          sub.id,
+        planMpId:      sub.preapproval_plan_id,
+        planClave:     cambio.nuevoPlanClave,
+        planNombre,
+        monto,
+        frecuencia,
+        frecuenciaTipo,
+        estado:        'activa',
+        actualizadoEn: ahora,
+      }, { merge: true })
+
+    await cambioRef.update({ estado: 'completado', completadoEn: ahora, mpId: sub.id })
+    console.log('[cambio-plan] Plan cambiado:', cambio.businessId, '→', cambio.nuevoPlanClave)
+
+    // Email de confirmación
+    enviarEmailCambioPlan({
+      businessId:      cambio.businessId,
+      email:           cambio.email,
+      planAnteriorNombre: cambio.planAnteriorNombre || cambio.planAnteriorClave,
+      nuevoPlanNombre: planNombre,
+      monto,
+      frecuencia,
+      frecuenciaTipo,
+    })
+
+  } else if (['cancelled', 'paused'].includes(sub.status)) {
+    await cambioRef.update({ estado: 'cancelado', actualizadoEn: ahora })
+    console.log('[cambio-plan] Cambio cancelado por el usuario:', cambioId)
+  }
+}
+
+// ── Helper: email de cambio de plan completado ───────────────────────────
+async function enviarEmailCambioPlan({ businessId, email, planAnteriorNombre, nuevoPlanNombre, monto, frecuencia, frecuenciaTipo }) {
+  const ciclo = frecuencia === 1 ? 'mes' : frecuencia === 3 ? 'trimestre' : 'año'
+  try {
+    await resend.emails.send({
+      from:    FROM_EMAIL,
+      to:      email,
+      subject: `✅ Tu plan Lealteck fue actualizado a ${nuevoPlanNombre}`,
+      html: `
+        <div style="font-family:system-ui,sans-serif;max-width:520px;margin:0 auto;color:#1c1410">
+          <h1 style="color:#c47a3a">¡Plan actualizado!</h1>
+          <p>Tu plan cambió de <strong>${planAnteriorNombre}</strong>
+             a <strong>${nuevoPlanNombre}</strong> exitosamente.</p>
+          <p>Nuevo monto: <strong>S/ ${monto} / ${ciclo}</strong>.</p>
+          <p>Tu suscripción anterior fue cancelada automáticamente — solo se cobra el nuevo plan.</p>
+          <p style="margin:20px 0">
+            <a href="https://${businessId}.lealteck.com"
+               style="background:#c47a3a;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:700">
+              Ir a mi panel →
+            </a>
+          </p>
+          <p style="color:#8b7355;font-size:0.8rem">Lealteck · lealteck.com</p>
+        </div>
+      `,
+    })
+    console.log('[email] Cambio de plan enviado a:', email)
+  } catch (err) {
+    console.error('[email] Error enviando cambio de plan:', err)
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  POST /cambiar-plan
+//  El dueño del negocio cambia a cualquiera de los 9 planes disponibles.
+//  Header: Authorization: Bearer <firebase-id-token>
+//  Cuerpo: { businessId, nuevoPlanClave }  (ej: 'lealfull-anual')
+//  Responde: { ok: true, urlSuscripcion }  → frontend redirige ahí
+// ─────────────────────────────────────────────────────────────────────
+app.post('/cambiar-plan', async (req, res) => {
+  const authHeader = req.headers['authorization'] || ''
+  const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null
+  if (!idToken) return res.status(401).json({ error: 'Token requerido.' })
+
+  let decoded
+  try {
+    decoded = await admin.auth().verifyIdToken(idToken)
+  } catch {
+    return res.status(401).json({ error: 'Token inválido.' })
+  }
+
+  const { businessId, nuevoPlanClave } = req.body || {}
+  if (!businessId || !nuevoPlanClave) {
+    return res.status(400).json({ error: 'Faltan businessId y/o nuevoPlanClave.' })
+  }
+
+  try {
+    // Verificar que el email del token es admin del negocio
+    const bizSnap = await db.collection('businesses').doc(businessId).get()
+    if (!bizSnap.exists) return res.status(404).json({ error: 'Negocio no encontrado.' })
+
+    const biz = bizSnap.data()
+    if (!biz.adminEmails?.includes(decoded.email)) {
+      return res.status(403).json({ error: 'No tenés permiso para modificar este negocio.' })
+    }
+
+    // Leer plan actual desde privado/suscripcion
+    const suscSnap = await db.collection('businesses').doc(businessId)
+      .collection('privado').doc('suscripcion').get()
+    const suscActual = suscSnap.exists ? suscSnap.data() : null
+    const planActualClave = suscActual?.planClave || biz.plan || ''
+
+    if (planActualClave === nuevoPlanClave) {
+      return res.status(400).json({ error: 'Ya estás en ese plan.' })
+    }
+
+    // Obtener el ID de MP del nuevo plan desde Firestore
+    const planDoc  = await db.collection('platform').doc('planes').get()
+    const planes   = planDoc.exists ? planDoc.data() : {}
+    const planData = planes[nuevoPlanClave]
+    const planId   = typeof planData === 'string' ? planData
+                   : typeof planData === 'object'  ? planData?.id
+                   : null
+
+    if (!planId) {
+      return res.status(400).json({
+        error: `Plan "${nuevoPlanClave}" no encontrado en Firestore. Contactá a soporte.`,
+      })
+    }
+
+    const planNombre = typeof planData === 'object' ? (planData.nombre || nuevoPlanClave) : nuevoPlanClave
+
+    // Guardar registro del cambio
+    const cambioRef = db.collection('platform').doc('cambios').collection('items').doc()
+    const cambioId  = cambioRef.id
+    await cambioRef.set({
+      businessId,
+      email:              decoded.email,
+      planAnteriorClave:  planActualClave,
+      planAnteriorNombre: suscActual?.planNombre || planActualClave,
+      nuevoPlanClave,
+      nuevoPlanNombre:    planNombre,
+      mpIdAnterior:       suscActual?.mpId || biz.suscripcion?.mpId || null,
+      estado:             'pendiente_pago',
+      creadoEn:           admin.firestore.FieldValue.serverTimestamp(),
+    })
+
+    // Crear nueva suscripción en MP para el plan elegido (sin trial — ya fue usado)
+    const preApproval = new PreApproval(mp)
+    const suscripcion = await preApproval.create({
+      body: {
+        preapproval_plan_id: planId,
+        reason:              `Cambio de plan Lealteck → ${planNombre}`,
+        external_reference:  `cambio:${cambioId}`,
+        payer_email:         decoded.email,
+        back_url:            `https://${businessId}.lealteck.com`,
+      },
+    })
+
+    await cambioRef.update({ urlSuscripcion: suscripcion.init_point, mpId: suscripcion.id })
+
+    console.log('[cambiar-plan] Cambio iniciado:', businessId, planActualClave, '→', nuevoPlanClave, 'cambioId:', cambioId)
+    res.json({ ok: true, urlSuscripcion: suscripcion.init_point })
+  } catch (err) {
+    console.error('[/cambiar-plan] Error:', err)
     res.status(500).json({ error: err.message })
   }
 })
