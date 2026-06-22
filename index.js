@@ -192,8 +192,12 @@ async function enviarEmailBienvenida({ nombre, email, plan, businessId }) {
   }
 }
 
-async function notificarRegistroNuevo({ nombre, rubro, dueno, email, whatsapp, plan, registroId }) {
-  const NOMBRE_PLAN = { lealcard: 'LealCard (S/60)', lealorder: 'LealOrder (S/90)', lealfull: 'LealFull (S/120)' }
+async function notificarRegistroNuevo({ nombre, rubro, dueno, email, whatsapp, plan, planClave, planMonto, planFrecuencia, registroId }) {
+  const ciclo = planClave?.endsWith('-anual') ? 'año'
+    : planClave?.endsWith('-trimestral') ? 'trimestre' : 'mes'
+  const descripcionPlan = planClave
+    ? `${planClave}${planMonto ? ` — S/ ${planMonto}/${ciclo}` : ''}`
+    : plan
   try {
     await resend.emails.send({
       from:    FROM_EMAIL,
@@ -208,7 +212,7 @@ async function notificarRegistroNuevo({ nombre, rubro, dueno, email, whatsapp, p
             <tr><td style="padding:6px 0;color:#8b7355">Dueño</td><td>${dueno || '—'}</td></tr>
             <tr><td style="padding:6px 0;color:#8b7355">Email</td><td>${email}</td></tr>
             <tr><td style="padding:6px 0;color:#8b7355">WhatsApp</td><td>${whatsapp}</td></tr>
-            <tr><td style="padding:6px 0;color:#8b7355">Plan</td><td><strong>${NOMBRE_PLAN[plan] || plan}</strong></td></tr>
+            <tr><td style="padding:6px 0;color:#8b7355">Plan</td><td><strong>${descripcionPlan}</strong></td></tr>
             <tr><td style="padding:6px 0;color:#8b7355">Estado</td><td>⏳ Pendiente de pago en MP</td></tr>
           </table>
           <p style="margin-top:20px;color:#8b7355;font-size:0.85rem">ID registro: ${registroId}</p>
@@ -235,20 +239,31 @@ app.get('/health', (_req, res) => {
 //  2. Devuelve la URL de suscripción del plan elegido
 // ─────────────────────────────────────────────────────────────────────
 app.post('/registro', async (req, res) => {
-  const { nombre, rubro, dueno, email, whatsapp, plan } = req.body || {}
+  // planClave incluye ciclo ('lealcard-mensual'), plan es la familia base ('lealcard')
+  const { nombre, rubro, dueno, email, whatsapp, plan, planClave } = req.body || {}
   if (!nombre || !email || !plan) {
     return res.status(400).json({ error: 'Faltan campos obligatorios: nombre, email, plan.' })
   }
+
+  // Clave efectiva: si Registro.jsx envió planClave (nuevo sistema de 9 planes),
+  // usarla; si no (llamada legacy), caer en la familia base.
+  const claveEfectiva = planClave || plan
 
   try {
     // ── Obtener el plan de MP guardado en Firestore
     const planDoc = await db.collection('platform').doc('planes').get()
     const planes  = planDoc.exists ? planDoc.data() : {}
-    const planId  = planes[plan]
+
+    // platform/planes guarda objetos { id, monto, frecuencia, frecuenciaTipo }
+    // o strings (formato legacy). Normalizamos siempre a { id, ... }.
+    const planData = planes[claveEfectiva]
+    const planId   = typeof planData === 'string' ? planData
+                   : typeof planData === 'object'  ? planData?.id
+                   : null
 
     if (!planId) {
       return res.status(400).json({
-        error: `Plan "${plan}" no encontrado. Ejecutá /setup/crear-planes primero.`,
+        error: `Plan "${claveEfectiva}" no encontrado en Firestore. Creá los planes desde el panel de SuperAdmin.`,
       })
     }
 
@@ -256,14 +271,20 @@ app.post('/registro', async (req, res) => {
     const ref = db.collection('platform').doc('registros').collection('items').doc()
     const registro = {
       nombre,
-      rubro:     rubro || '',
-      dueno:     dueno || '',
+      rubro:       rubro || '',
+      dueno:       dueno || '',
       email,
-      whatsapp:  whatsapp || '',
-      plan,
-      planMpId:  planId,
-      estado:    'pendiente_pago',
-      creadoEn:  admin.firestore.FieldValue.serverTimestamp(),
+      whatsapp:    whatsapp || '',
+      plan,                        // familia base: lealcard | lealorder | lealfull
+      planClave:   claveEfectiva,  // con ciclo: lealcard-mensual | lealcard-anual …
+      planMpId:    planId,
+      // Guardar monto/frecuencia del plan para no tener que buscarlo en activarNegocio
+      planMonto:      typeof planData === 'object' ? (planData.monto || 0) : 0,
+      planFrecuencia: typeof planData === 'object' ? (planData.frecuencia || 1) : 1,
+      planFrecuenciaTipo: typeof planData === 'object' ? (planData.frecuenciaTipo || 'months') : 'months',
+      planNombre:     typeof planData === 'object' ? (planData.nombre || claveEfectiva) : claveEfectiva,
+      estado:      'pendiente_pago',
+      creadoEn:    admin.firestore.FieldValue.serverTimestamp(),
     }
     await ref.set(registro)
 
@@ -286,7 +307,13 @@ app.post('/registro', async (req, res) => {
     await ref.update({ registroId, urlSuscripcion })
 
     // Notificar a Ivan por email (no bloqueante)
-    notificarRegistroNuevo({ nombre, rubro, dueno, email, whatsapp, plan, registroId })
+    notificarRegistroNuevo({
+      nombre, rubro, dueno, email, whatsapp,
+      plan, planClave: claveEfectiva,
+      planMonto:    registro.planMonto,
+      planFrecuencia: registro.planFrecuencia,
+      registroId,
+    })
 
     res.json({ ok: true, registroId, urlSuscripcion })
   } catch (err) {
@@ -476,12 +503,22 @@ async function activarNegocio({ registro, registroId, sub }) {
 
   const ahora = admin.firestore.FieldValue.serverTimestamp()
 
-  // Buscar config del plan para saber monto y frecuencia
-  const planConfig = PLANES_CONFIG.find(p => p.key === registro.plan) || {}
-  const monto      = planConfig.auto_recurring?.transaction_amount || 0
-  const frecuencia = planConfig.auto_recurring?.frequency || 1
-  const frecuenciaTipo = planConfig.auto_recurring?.frequency_type || 'months'
-  const planNombre = planConfig.reason || registro.plan
+  // Leer monto/frecuencia desde el registro (guardados al crear el registro en /registro)
+  // o, como fallback, buscar en PLANES_CONFIG por la familia base del plan.
+  let monto, frecuencia, frecuenciaTipo, planNombre
+  if (registro.planMonto) {
+    monto          = registro.planMonto
+    frecuencia     = registro.planFrecuencia     || 1
+    frecuenciaTipo = registro.planFrecuenciaTipo || 'months'
+    planNombre     = registro.planNombre         || registro.planClave || registro.plan
+  } else {
+    // Fallback para registros legacy (sin planMonto) — busca en PLANES_CONFIG por familia
+    const planConfig = PLANES_CONFIG.find(p => p.key === registro.plan) || {}
+    monto          = planConfig.auto_recurring?.transaction_amount || 0
+    frecuencia     = planConfig.auto_recurring?.frequency || 1
+    frecuenciaTipo = planConfig.auto_recurring?.frequency_type || 'months'
+    planNombre     = planConfig.reason || registro.plan
+  }
 
   await db.collection('businesses').doc(businessId).set({
     id:           businessId,
@@ -506,7 +543,7 @@ async function activarNegocio({ registro, registroId, sub }) {
     .collection('privado').doc('suscripcion').set({
       mpId:         sub.id,
       planMpId:     sub.preapproval_plan_id,
-      planClave:    registro.plan,
+      planClave:    registro.planClave || registro.plan, // con ciclo si existe
       planNombre,
       monto,
       frecuencia,
