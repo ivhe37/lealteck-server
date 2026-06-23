@@ -49,10 +49,15 @@ const app = express()
 // CORS: solo orígenes de Lealteck (y localhost/127 para desarrollo local).
 // Los webhooks de MercadoPago no envían Origin, así que !origin los deja pasar.
 const CORS_LEALTECK = /^https:\/\/([a-z0-9-]+\.)?lealteck\.com$/
+const CORS_FIREBASE = /^https:\/\/lealteck-plataforma\.(web\.app|firebaseapp\.com)$/
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin) return cb(null, true) // webhooks MP, curl, server-to-server
-    if (CORS_LEALTECK.test(origin) || /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+    if (
+      CORS_LEALTECK.test(origin) ||
+      CORS_FIREBASE.test(origin) ||
+      /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)
+    ) {
       return cb(null, true)
     }
     cb(new Error(`CORS: origen no permitido — ${origin}`))
