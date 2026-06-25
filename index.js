@@ -19,6 +19,7 @@
 const express   = require('express')
 const cors      = require('cors')
 const crypto    = require('crypto')
+const rateLimit = require('express-rate-limit')
 const admin     = require('firebase-admin')
 const { MercadoPagoConfig, PreApprovalPlan, PreApproval, Preference } = require('mercadopago')
 const { Resend } = require('resend')
@@ -67,6 +68,18 @@ app.use(cors({
 
 app.use(express.json())
 
+// Límite de intentos para /registro: sin esto, cualquiera puede mandar
+// cientos de POSTs con emails inventados — spam de notificaciones a Ivan,
+// docs huérfanos en platform/registros, y consumo de cuota de la API de MP
+// al crear una suscripción por cada intento.
+const limiteRegistro = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 5,                   // 5 intentos por IP en esa ventana
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Demasiados intentos. Esperá unos minutos y volvé a intentar.' },
+})
+
 // ─────────────────────────────────────────────────────────────────────
 //  VERIFICACIÓN DE FIRMA DE WEBHOOKS DE MERCADOPAGO
 //  MP envía x-signature: "ts=<epoch>,v1=<hmac-sha256>"
@@ -102,6 +115,23 @@ function verificarFirmaMP(req) {
     .digest('hex')
 
   return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(v1))
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  TOKEN DE ADMINISTRACIÓN para endpoints internos (/setup/*, /admin/*)
+//  Separado de MP_ACCESS_TOKEN a propósito: ese token cobra plata, este
+//  solo abre rutas internas — reusar el mismo mezcla dos responsabilidades
+//  distintas (rotar uno no debería obligar a rotar el otro).
+//  Mientras ADMIN_SECRET no esté configurado en Render, se acepta también
+//  MP_ACCESS_TOKEN como respaldo (modo de transición, no rompe el acceso
+//  que ya existía) — con una advertencia en los logs para no olvidarlo.
+// ─────────────────────────────────────────────────────────────────────
+function verificarAdminToken(req) {
+  const token = req.headers['x-admin-token']
+  if (!token) return false
+  if (process.env.ADMIN_SECRET) return token === process.env.ADMIN_SECRET
+  console.warn('[admin] ADMIN_SECRET no configurado — aceptando MP_ACCESS_TOKEN como respaldo temporal')
+  return token === process.env.MP_ACCESS_TOKEN
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -255,7 +285,7 @@ app.get('/health', (_req, res) => {
 //  1. Guarda en platform/registros/{id}
 //  2. Devuelve la URL de suscripción del plan elegido
 // ─────────────────────────────────────────────────────────────────────
-app.post('/registro', async (req, res) => {
+app.post('/registro', limiteRegistro, async (req, res) => {
   // planClave incluye ciclo ('lealcard-mensual'), plan es la familia base ('lealcard')
   const { nombre, rubro, dueno, email, whatsapp, plan, planClave, referidoPor } = req.body || {}
   if (!nombre || !email || !plan) {
@@ -505,6 +535,11 @@ async function agregarDominioAuth(dominio) {
   }
 }
 
+// Mismos nombres reservados que src/config/resolveBusiness.js — un negocio
+// con uno de estos slugs jamás sería alcanzable por su subdominio (la app
+// los trata como rutas propias de la plataforma, no como negocios).
+const SUBDOMINIOS_RESERVADOS = new Set(['www', 'admin', 'app', 'api', 'mail', 'soporte'])
+
 // ── Helper: crear / activar negocio en Firestore ──────────────────────
 async function activarNegocio({ registro, registroId, sub }) {
   const registroRef = db
@@ -515,16 +550,28 @@ async function activarNegocio({ registro, registroId, sub }) {
 
   if (!businessId) {
     // Generar ID a partir del nombre del negocio (slug simple)
-    businessId = registro.nombre
+    const slugBase = registro.nombre
       .toLowerCase()
       .normalize('NFD').replace(/[̀-ͯ]/g, '') // quitar tildes
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/(^-|-$)/g, '')
       .substring(0, 30)
 
-    // Si ya existe ese ID, le agregamos sufijo numérico
-    const existe = await db.collection('businesses').doc(businessId).get()
-    if (existe.exists) businessId = `${businessId}-${Date.now().toString(36)}`
+    // Si coincide con un subdominio reservado, el negocio jamás sería
+    // alcanzable por URL — le damos un sufijo fijo en vez de dejarlo huérfano.
+    const slugDeseado = SUBDOMINIOS_RESERVADOS.has(slugBase) ? `${slugBase}-negocio` : slugBase
+
+    // Comprobar disponibilidad y reservar el ID en una sola transacción:
+    // sin esto, dos registros simultáneos con el mismo nombre podrían pasar
+    // el check de existencia al mismo tiempo y terminar pisándose más abajo
+    // (el set() final usa merge:true).
+    businessId = await db.runTransaction(async (tx) => {
+      let candidato = slugDeseado
+      const snap = await tx.get(db.collection('businesses').doc(candidato))
+      if (snap.exists) candidato = `${slugDeseado}-${Date.now().toString(36)}`
+      tx.set(db.collection('businesses').doc(candidato), { id: candidato }, { merge: true })
+      return candidato
+    })
   }
 
   const ahora = admin.firestore.FieldValue.serverTimestamp()
@@ -878,11 +925,29 @@ app.post('/webhook/pago', async (req, res) => {
 //  Crea una preferencia de pago MP para tarjeta y devuelve init_point
 // ─────────────────────────────────────────────────────────────────────
 app.post('/crear-preferencia', async (req, res) => {
+  // Quien llega al checkout de tarjeta ya inició sesión (CartPage.jsx exige
+  // un usuario logueado antes de mostrar esta opción) — exigir el mismo
+  // Bearer token que el resto de los endpoints evita que cualquiera, sin
+  // sesión, pueda generar links de pago de MercadoPago a su gusto.
+  const authHeader = req.headers['authorization'] || ''
+  const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null
+  if (!idToken) return res.status(401).json({ error: 'Token requerido.' })
+  try {
+    await admin.auth().verifyIdToken(idToken)
+  } catch {
+    return res.status(401).json({ error: 'Token inválido.' })
+  }
+
   const { items, businessId } = req.body || {}
   if (!items?.length || !businessId) {
     return res.status(400).json({ error: 'Faltan items o businessId.' })
   }
   try {
+    const bizSnap = await db.collection('businesses').doc(businessId).get()
+    if (!bizSnap.exists || bizSnap.data()?.activo === false) {
+      return res.status(404).json({ error: 'Negocio no disponible.' })
+    }
+
     const pref = new Preference(mp)
     const result = await pref.create({
       body: {
@@ -909,8 +974,7 @@ app.post('/crear-preferencia', async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────
 app.post('/setup/crear-planes', async (req, res) => {
   // Protección mínima: requiere el mismo Access Token como header
-  const auth = req.headers['x-admin-token']
-  if (auth !== process.env.MP_ACCESS_TOKEN) {
+  if (!verificarAdminToken(req)) {
     return res.status(401).json({ error: 'No autorizado.' })
   }
 
@@ -941,8 +1005,7 @@ app.post('/setup/crear-planes', async (req, res) => {
 //  Body: { key: 'lealpro' }
 // ─────────────────────────────────────────────────────────────────────
 app.post('/setup/crear-plan-nuevo', async (req, res) => {
-  const auth = req.headers['x-admin-token']
-  if (auth !== process.env.MP_ACCESS_TOKEN) {
+  if (!verificarAdminToken(req)) {
     return res.status(401).json({ error: 'No autorizado.' })
   }
   const { key } = req.body || {}
@@ -1421,8 +1484,7 @@ app.post('/cancelar-suscripcion', async (req, res) => {
 //  Header: x-admin-token: <MP_ACCESS_TOKEN>
 // ─────────────────────────────────────────────────────────────────────
 app.post('/admin/linkear-negocio', async (req, res) => {
-  const auth = req.headers['x-admin-token']
-  if (auth !== process.env.MP_ACCESS_TOKEN) {
+  if (!verificarAdminToken(req)) {
     return res.status(401).json({ error: 'No autorizado.' })
   }
 
@@ -1451,8 +1513,7 @@ app.post('/admin/linkear-negocio', async (req, res) => {
 //  Header: x-admin-token: <MP_ACCESS_TOKEN>
 // ─────────────────────────────────────────────────────────────────────
 app.post('/admin/activar-registro', async (req, res) => {
-  const auth = req.headers['x-admin-token']
-  if (auth !== process.env.MP_ACCESS_TOKEN) {
+  if (!verificarAdminToken(req)) {
     return res.status(401).json({ error: 'No autorizado.' })
   }
 
